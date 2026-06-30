@@ -92,7 +92,8 @@ import (
 
 const (
 	pluginID      = "codex-usage-guard"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.1.1"
+	pluginRepo    = "https://github.com/huangdaoxu/codex-usage-guard"
 	abiVersion    = 1
 	schemaVersion = 1
 
@@ -334,7 +335,8 @@ func registrationJSON() string {
 	return `{"schema_version":` + strconv.Itoa(schemaVersion) +
 		`,"metadata":{"Name":"` + pluginID +
 		`","Version":"` + pluginVersion +
-		`","Author":"galaxy-router","GitHubRepository":"","Logo":"","ConfigFields":[]}` +
+		`","Author":"galaxy-router","GitHubRepository":"` + pluginRepo +
+		`","Logo":"","ConfigFields":[]}` +
 		`,"capabilities":{"usage_plugin":true}}`
 }
 
