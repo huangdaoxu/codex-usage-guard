@@ -92,7 +92,7 @@ import (
 
 const (
 	pluginID      = "codex-usage-guard"
-	pluginVersion = "0.1.1"
+	pluginVersion = "0.1.2"
 	pluginRepo    = "https://github.com/huangdaoxu/codex-usage-guard"
 	abiVersion    = 1
 	schemaVersion = 1
@@ -109,9 +109,16 @@ const (
 	methodHostAuthSave = "host.auth.save"
 	methodHostLog      = "host.log"
 
+	// Management API resource (read-only usage snapshot for the fleet/customers).
+	methodManagementRegister = "management.register"
+	methodManagementHandle   = "management.handle"
+	usageResourcePath        = "/usage"
+
 	// Codex rate-limit response headers (case-insensitive lookup).
 	headerPrimaryPercent   = "x-codex-primary-used-percent"
 	headerSecondaryPercent = "x-codex-secondary-used-percent"
+	headerPrimaryWindow    = "x-codex-primary-window-minutes"
+	headerSecondaryWindow  = "x-codex-secondary-window-minutes"
 
 	// Markers written into the auth file so the resume loop only ever touches
 	// accounts THIS plugin disabled.
@@ -258,6 +265,34 @@ type hostLogRequest struct {
 	Fields  map[string]any `json:"fields,omitempty"`
 }
 
+// managementResponse is returned to the host for a management/resource request.
+// Body is base64-encoded over the wire (Go []byte JSON marshaling).
+type managementResponse struct {
+	StatusCode int                 `json:"StatusCode"`
+	Headers    map[string][]string `json:"Headers"`
+	Body       []byte              `json:"Body"`
+}
+
+// usageEntry is one account's latest usage reading, exposed via /usage.
+type usageEntry struct {
+	AuthID        string  `json:"auth_id"`
+	AuthIndex     string  `json:"auth_index,omitempty"`
+	Email         string  `json:"email,omitempty"`
+	Primary5hPct  float64 `json:"primary_5h_percent"`
+	Primary5hRem  float64 `json:"primary_5h_remaining_percent"`
+	PrimaryWindow int     `json:"primary_window_minutes,omitempty"`
+	WeeklyPct     float64 `json:"weekly_percent"`
+	WeeklyRem     float64 `json:"weekly_remaining_percent"`
+	WeeklyWindow  int     `json:"weekly_window_minutes,omitempty"`
+	LastModel     string  `json:"last_model,omitempty"`
+	UpdatedAtUnix int64   `json:"updated_at"`
+}
+
+var (
+	snapMu sync.RWMutex
+	snap   = map[string]usageEntry{}
+)
+
 // ---------------------------------------------------------------------------
 // C ABI exports
 // ---------------------------------------------------------------------------
@@ -326,6 +361,15 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case methodUsageHandle:
 		handleUsage(request)
 		return okEnvelopeJSON("{}")
+	case methodManagementRegister:
+		return okEnvelopeJSON(`{"resources":[{"Path":"` + usageResourcePath +
+			`","Menu":"Codex Usage","Description":"Per-account 5h/weekly Codex usage snapshot"}]}`)
+	case methodManagementHandle:
+		return okEnvelope(managementResponse{
+			StatusCode: 200,
+			Headers:    map[string][]string{"content-type": {"application/json; charset=utf-8"}},
+			Body:       serveUsageJSON(),
+		})
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -337,7 +381,7 @@ func registrationJSON() string {
 		`","Version":"` + pluginVersion +
 		`","Author":"galaxy-router","GitHubRepository":"` + pluginRepo +
 		`","Logo":"","ConfigFields":[]}` +
-		`,"capabilities":{"usage_plugin":true}}`
+		`,"capabilities":{"usage_plugin":true,"management_api":true}}`
 }
 
 func applyLifecycleConfig(request []byte) {
@@ -369,13 +413,28 @@ func handleUsage(request []byte) {
 	if err := json.Unmarshal(request, &rec); err != nil {
 		return
 	}
-	if len(rec.ResponseHeaders) == 0 {
-		return
-	}
 	c := currentConfig()
 
-	primary := parsePercent(headerGet(rec.ResponseHeaders, headerPrimaryPercent))
-	secondary := parsePercent(headerGet(rec.ResponseHeaders, headerSecondaryPercent))
+	primaryRaw := headerGet(rec.ResponseHeaders, headerPrimaryPercent)
+	secondaryRaw := headerGet(rec.ResponseHeaders, headerSecondaryPercent)
+	primary := parsePercent(primaryRaw)
+	secondary := parsePercent(secondaryRaw)
+	primaryWindow := parseInt(headerGet(rec.ResponseHeaders, headerPrimaryWindow))
+	secondaryWindow := parseInt(headerGet(rec.ResponseHeaders, headerSecondaryWindow))
+
+	// Always record the latest reading (for the /usage resource) and log it so
+	// the data is visible during testing — even when no header is present, so we
+	// can tell "hook fired but no header" from "hook never fired".
+	updateSnapshot(rec, primary, primaryWindow, secondary, secondaryWindow)
+	hostLog("info", "codex-usage-guard observed", map[string]any{
+		"auth_id":            rec.AuthID,
+		"model":              rec.Model,
+		"header_count":       len(rec.ResponseHeaders),
+		"primary_5h_pct":     primaryRaw,
+		"primary_window_min": primaryWindow,
+		"weekly_pct":         secondaryRaw,
+		"weekly_window_min":  secondaryWindow,
+	})
 
 	// Pick the window that tripped; if both trip prefer the weekly one because
 	// it needs the longer recovery time.
@@ -746,6 +805,103 @@ func toInt64(v any) int64 {
 
 func okEnvelopeJSON(result string) ([]byte, error) {
 	return json.Marshal(envelope{OK: true, Result: json.RawMessage(result)})
+}
+
+func okEnvelope(v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(envelope{OK: true, Result: raw})
+}
+
+func parseInt(s string) int {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// updateSnapshot merges the latest reading for an account. Percent fields are
+// only overwritten when the header was actually present (parsed >= 0), so a
+// later header-less request never wipes a known value.
+func updateSnapshot(rec usageRecord, primary float64, primaryWindow int, secondary float64, secondaryWindow int) {
+	key := accountKey(rec.AuthID, rec.AuthIndex)
+	if key == "" {
+		return
+	}
+	snapMu.Lock()
+	e := snap[key]
+	e.AuthID = rec.AuthID
+	e.AuthIndex = rec.AuthIndex
+	if primary >= 0 {
+		e.Primary5hPct = primary
+		e.Primary5hRem = 100 - primary
+		if primaryWindow > 0 {
+			e.PrimaryWindow = primaryWindow
+		}
+	}
+	if secondary >= 0 {
+		e.WeeklyPct = secondary
+		e.WeeklyRem = 100 - secondary
+		if secondaryWindow > 0 {
+			e.WeeklyWindow = secondaryWindow
+		}
+	}
+	if rec.Model != "" {
+		e.LastModel = rec.Model
+	}
+	e.UpdatedAtUnix = time.Now().Unix()
+	snap[key] = e
+	snapMu.Unlock()
+}
+
+// serveUsageJSON renders the current snapshot, enriching each account with its
+// email via a best-effort host.auth.list lookup.
+func serveUsageJSON() []byte {
+	emailByID := map[string]string{}
+	if files, err := listAuth(); err == nil {
+		for _, f := range files {
+			if f.Email == "" {
+				continue
+			}
+			if f.ID != "" {
+				emailByID[f.ID] = f.Email
+			}
+			if f.AuthIndex != "" {
+				emailByID[f.AuthIndex] = f.Email
+			}
+		}
+	}
+	snapMu.RLock()
+	entries := make([]usageEntry, 0, len(snap))
+	for _, e := range snap {
+		if e.Email == "" {
+			if em := emailByID[e.AuthID]; em != "" {
+				e.Email = em
+			} else if em := emailByID[e.AuthIndex]; em != "" {
+				e.Email = em
+			}
+		}
+		entries = append(entries, e)
+	}
+	snapMu.RUnlock()
+	out := map[string]any{
+		"plugin":       pluginID,
+		"version":      pluginVersion,
+		"generated_at": time.Now().Unix(),
+		"accounts":     entries,
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return []byte(`{"error":"marshal failed"}`)
+	}
+	return raw
 }
 
 func errorEnvelope(code, message string) []byte {

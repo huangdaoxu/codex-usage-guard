@@ -4,9 +4,9 @@
     {
       "id": "codex-usage-guard",
       "name": "Codex Usage Guard",
-      "description": "Disables a Codex account once its 5h or weekly usage crosses a configured threshold, then auto-resumes it after the window rolls off.",
+      "description": "Disables a Codex account once its 5h or weekly usage crosses a configured threshold, then auto-resumes it after the window rolls off. Exposes a read-only per-account usage snapshot at /v0/resource/plugins/codex-usage-guard/usage.",
       "author": "galaxy-router",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "repository": "https://github.com/huangdaoxu/codex-usage-guard",
       "license": "MIT",
       "tags": ["codex", "usage", "load-shedding"],
@@ -16,9 +16,9 @@
           {
             "goos": "windows",
             "goarch": "amd64",
-            "url": "https://github.com/huangdaoxu/codex-usage-guard/releases/download/v0.1.1/codex-usage-guard-windows-amd64.zip",
-            "sha256": "58d7341e2efd6dc1244146ce945885660d8ccd06efbbb689c6c8445979059af3",
-            "size": 2174060
+            "url": "https://github.com/huangdaoxu/codex-usage-guard/releases/download/v0.1.2/codex-usage-guard-windows-amd64.zip",
+            "sha256": "3ab55d0e766545e966f1825932d6e9ea8d0ef36f1d9c0e0be6cf56ff6d3d4754",
+            "size": 2181884
           }
         ]
       }
